@@ -321,7 +321,9 @@ class BotSort_gsr(BaseTracker):
 
         outputs = [
             [*t.xyxy, t.id, t.cls, t.conf, t.det_ind]
-            for t in self.active_tracks if t.is_activated
+            for t in self.active_tracks
+            if t.is_activated 
         ]
+
 
         return np.asarray(outputs)
