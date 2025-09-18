@@ -37,15 +37,60 @@ class STrack(BaseTrack):
             self.update_features(feat)
 
     def update_features(self, feat):
-        """Normalize and update feature vectors."""
-        feat /= np.linalg.norm(feat)
+        """
+        Make appearance feature update robust:
+        - ensure 1D float32
+        - normalize L2
+        - ensure self.features is a list before appending
+        - keep smooth_feat as EMA and normalize
+        """
+        import numpy as np
+
+        # to 1D float32
+        feat = np.asarray(feat, dtype=np.float32)
+        if feat.ndim > 1:
+            # (D,1) or (1,D) or (N,D) -> use a single 1D vector
+            if 1 in feat.shape:
+                feat = feat.reshape(-1)
+            else:
+                # 万一 (N,D) を渡された場合は最初のベクトルを使用（あるいは平均でも可）
+                feat = feat[0].reshape(-1)
+        elif feat.ndim == 0:
+            # スカラーは不正。ゼロベクトルで回避
+            feat = np.zeros(128, dtype=np.float32)  # 次元は任意（使われないケース）
+        # L2 normalize (avoid NaN)
+        n = np.linalg.norm(feat)
+        if n > 0:
+            feat = feat / n
+
+        # ensure list
+        if not isinstance(self.features, list):
+            # 既に配列にされてしまっていた場合はリストに戻す
+            try:
+                arr = np.asarray(self.features, dtype=np.float32)
+                if arr.ndim == 1:
+                    self.features = [arr]
+                elif arr.ndim == 2:
+                    self.features = [arr_i.reshape(-1) for arr_i in arr]
+                else:
+                    self.features = []
+            except Exception:
+                self.features = []
+
+        # set curr & append history
         self.curr_feat = feat
-        if self.smooth_feat is None:
+        self.features.append(feat)
+
+        # smooth_feat (EMA)
+        alpha = getattr(self, "alpha", 0.9)
+        if getattr(self, "smooth_feat", None) is None:
             self.smooth_feat = feat
         else:
-            self.smooth_feat = self.alpha * self.smooth_feat + (1 - self.alpha) * feat
-        self.smooth_feat /= np.linalg.norm(self.smooth_feat)
-        self.features.append(feat)
+            self.smooth_feat = alpha * self.smooth_feat + (1 - alpha) * feat
+            # normalize to keep scale stable
+            sn = np.linalg.norm(self.smooth_feat)
+            if sn > 0:
+                self.smooth_feat = self.smooth_feat / sn
 
     def update_cls(self, cls, conf):
         """Update class history based on detection confidence."""
