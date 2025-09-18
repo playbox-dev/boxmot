@@ -74,32 +74,22 @@ def linear_assignment(cost_matrix, thresh):
 
 def ious(atlbrs, btlbrs):
     """
-    Compute cost based on IoU
-    :type atlbrs: list[tlbr] | np.ndarray
-    :type atlbrs: list[tlbr] | np.ndarray
-
-    :rtype ious np.ndarray
+    Compute IoU matrix.
+    :param atlbrs: list[tlbr] | np.ndarray (N,4)
+    :param btlbrs: list[tlbr] | np.ndarray (M,4)
+    :return: (N,M) IoU matrix
     """
-    ious = np.zeros((len(atlbrs), len(btlbrs)), dtype=np.float32)
-    if ious.size == 0:
-        return ious
-
-    ious = bbox_ious(
-        np.ascontiguousarray(atlbrs, dtype=np.float32),
-        np.ascontiguousarray(btlbrs, dtype=np.float32),
+    atlbrs = np.ascontiguousarray(atlbrs, dtype=np.float32)
+    btlbrs = np.ascontiguousarray(btlbrs, dtype=np.float32)
+    return AssociationFunction.iou_batch(atlbrs, btlbrs) if len(atlbrs) and len(btlbrs) else np.zeros(
+        (len(atlbrs), len(btlbrs)), dtype=np.float32
     )
 
-    return ious
 
 def d_iou_distance(atracks, btracks):
     """
-    Compute cost based on IoU
-    :type atracks: list[STrack]
-    :type btracks: list[STrack]
-
-    :rtype cost_matrix np.ndarray
+    Compute cost based on DIoU
     """
-
     if (len(atracks) > 0 and isinstance(atracks[0], np.ndarray)) or (
         len(btracks) > 0 and isinstance(btracks[0], np.ndarray)
     ):
@@ -109,24 +99,18 @@ def d_iou_distance(atracks, btracks):
         atlbrs = [track.xyxy for track in atracks]
         btlbrs = [track.xyxy for track in btracks]
 
-    ious = np.zeros((len(atlbrs), len(btlbrs)), dtype=np.float32)
-    if ious.size == 0:
-        return ious
+    if len(atlbrs) == 0 or len(btlbrs) == 0:
+        return np.zeros((len(atlbrs), len(btlbrs)), dtype=np.float32)
+
     _ious = AssociationFunction.diou_batch(atlbrs, btlbrs)
-
     cost_matrix = 1 - _ious
-
     return cost_matrix
+
 
 def iou_distance(atracks, btracks):
     """
     Compute cost based on IoU
-    :type atracks: list[STrack]
-    :type btracks: list[STrack]
-
-    :rtype cost_matrix np.ndarray
     """
-
     if (len(atracks) > 0 and isinstance(atracks[0], np.ndarray)) or (
         len(btracks) > 0 and isinstance(btracks[0], np.ndarray)
     ):
@@ -136,25 +120,18 @@ def iou_distance(atracks, btracks):
         atlbrs = [track.xyxy for track in atracks]
         btlbrs = [track.xyxy for track in btracks]
 
-    ious = np.zeros((len(atlbrs), len(btlbrs)), dtype=np.float32)
-    if ious.size == 0:
-        return ious
+    if len(atlbrs) == 0 or len(btlbrs) == 0:
+        return np.zeros((len(atlbrs), len(btlbrs)), dtype=np.float32)
+
     _ious = AssociationFunction.iou_batch(atlbrs, btlbrs)
-
     cost_matrix = 1 - _ious
-
     return cost_matrix
 
 
 def v_iou_distance(atracks, btracks):
     """
-    Compute cost based on IoU
-    :type atracks: list[STrack]
-    :type btracks: list[STrack]
-
-    :rtype cost_matrix np.ndarray
+    Compute cost based on IoU of predicted boxes
     """
-
     if (len(atracks) > 0 and isinstance(atracks[0], np.ndarray)) or (
         len(btracks) > 0 and isinstance(btracks[0], np.ndarray)
     ):
@@ -163,34 +140,97 @@ def v_iou_distance(atracks, btracks):
     else:
         atlbrs = [track.tlwh_to_tlbr(track.pred_bbox) for track in atracks]
         btlbrs = [track.tlwh_to_tlbr(track.pred_bbox) for track in btracks]
+
+    if len(atlbrs) == 0 or len(btlbrs) == 0:
+        return np.zeros((len(atlbrs), len(btlbrs)), dtype=np.float32)
+
     _ious = ious(atlbrs, btlbrs)
     cost_matrix = 1 - _ious
-
     return cost_matrix
+
+
+# --------- robust embedding distance (fixed) ---------
+
+def _get_feat(obj, prefer):
+    """Get a 1D float32 feature vector from an object with fallbacks."""
+    for name in ([prefer] + ["curr_feat", "smooth_feat", "feat", "feature", "features"]):
+        if hasattr(obj, name):
+            val = getattr(obj, name)
+            if val is None:
+                continue
+            a = np.asarray(val, dtype=np.float32)
+            # squeeze to 1D if it's shape (1, D) or (D, 1)
+            if a.ndim == 2 and 1 in a.shape:
+                a = a.reshape(-1)
+            elif a.ndim > 2:
+                a = a.reshape(-1)
+            elif a.ndim == 0:
+                continue
+            if a.size == 0:
+                continue
+            return a
+    return None
+
+
+def _stack_valid_1d(vectors):
+    """Return (indices, matrix) where matrix is 2D [K, D], skipping invalid entries."""
+    idx = []
+    buf = []
+    D = None
+    # first pass: decide D from first valid vector
+    for i, v in enumerate(vectors):
+        if v is not None:
+            D = int(v.size)
+            break
+    if D is None:
+        return [], None
+    for i, v in enumerate(vectors):
+        if v is None:
+            continue
+        if v.size != D:
+            # size mismatch -> skip
+            continue
+        buf.append(v.reshape(1, D))
+        idx.append(i)
+    if len(idx) == 0:
+        return [], None
+    mat = np.vstack(buf).astype(np.float32, copy=False)  # (K, D)
+    return idx, mat
 
 
 def embedding_distance(tracks, detections, metric="cosine"):
     """
-    :param tracks: list[STrack]
-    :param detections: list[BaseTrack]
-    :param metric:
-    :return: cost_matrix np.ndarray
+    Compute appearance distance between tracks and detections.
+    Robust to None/missing/shape-mismatch by returning 1.0 (far) for those cells.
     """
+    n_t, n_d = len(tracks), len(detections)
+    cost_matrix = np.ones((n_t, n_d), dtype=np.float32)
+    if n_t == 0 or n_d == 0:
+        return np.zeros((n_t, n_d), dtype=np.float32)
 
-    cost_matrix = np.zeros((len(tracks), len(detections)), dtype=np.float32)
-    if cost_matrix.size == 0:
+    # collect raw vectors
+    t_vecs = [_get_feat(t, "smooth_feat") for t in tracks]
+    d_vecs = [_get_feat(d, "curr_feat") for d in detections]
+
+    # build 2D matrices for valid subsets
+    t_idx, t_mat = _stack_valid_1d(t_vecs)
+    d_idx, d_mat = _stack_valid_1d(d_vecs)
+
+    if t_mat is None or d_mat is None:
+        # nothing valid -> keep ones (far)
         return cost_matrix
-    det_features = np.asarray(
-        [track.curr_feat for track in detections], dtype=np.float32
-    )
-    # for i, track in enumerate(tracks):
-    # cost_matrix[i, :] = np.maximum(0.0, cdist(track.smooth_feat.reshape(1,-1), det_features, metric))
-    track_features = np.asarray(
-        [track.smooth_feat for track in tracks], dtype=np.float32
-    )
-    cost_matrix = np.maximum(
-        0.0, cdist(track_features, det_features, metric)
-    )  # Nomalized features
+
+    try:
+        sub = cdist(t_mat, d_mat, metric)  # (len(t_idx), len(d_idx))
+        sub = np.maximum(0.0, sub)  # safety clip
+    except Exception:
+        # if anything goes wrong, just return "far"
+        return cost_matrix
+
+    # place back into full matrix
+    for ii, i in enumerate(t_idx):
+        cost_matrix[i, d_idx] = sub[ii]
+
     return cost_matrix
 
 
@@ -249,19 +289,7 @@ def fuse_score(cost_matrix, detections):
 
 
 def _pdist(a, b):
-    """Compute pair-wise squared distance between points in `a` and `b`.
-    Parameters
-    ----------
-    a : array_like
-        An NxM matrix of N samples of dimensionality M.
-    b : array_like
-        An LxM matrix of L samples of dimensionality M.
-    Returns
-    -------
-    ndarray
-        Returns a matrix of size len(a), len(b) such that eleement (i, j)
-        contains the squared distance between `a[i]` and `b[j]`.
-    """
+    """Compute pair-wise squared distance between points in `a` and `b`."""
     a, b = np.asarray(a), np.asarray(b)
     if len(a) == 0 or len(b) == 0:
         return np.zeros((len(a), len(b)))
@@ -272,22 +300,7 @@ def _pdist(a, b):
 
 
 def _cosine_distance(a, b, data_is_normalized=False):
-    """Compute pair-wise cosine distance between points in `a` and `b`.
-    Parameters
-    ----------
-    a : array_like
-        An NxM matrix of N samples of dimensionality M.
-    b : array_like
-        An LxM matrix of L samples of dimensionality M.
-    data_is_normalized : Optional[bool]
-        If True, assumes rows in a and b are unit length vectors.
-        Otherwise, a and b are explicitly normalized to lenght 1.
-    Returns
-    -------
-    ndarray
-        Returns a matrix of size len(a), len(b) such that eleement (i, j)
-        contains the squared distance between `a[i]` and `b[j]`.
-    """
+    """Compute pair-wise cosine distance between points in `a` and `b`."""
     if not data_is_normalized:
         a = np.asarray(a) / np.linalg.norm(a, axis=1, keepdims=True)
         b = np.asarray(b) / np.linalg.norm(b, axis=1, keepdims=True)
@@ -295,43 +308,16 @@ def _cosine_distance(a, b, data_is_normalized=False):
 
 
 def _nn_euclidean_distance(x, y):
-    """Helper function for nearest neighbor distance metric (Euclidean).
-    Parameters
-    ----------
-    x : ndarray
-        A matrix of N row-vectors (sample points).
-    y : ndarray
-        A matrix of M row-vectors (query points).
-    Returns
-    -------
-    ndarray
-        A vector of length M that contains for each entry in `y` the
-        smallest Euclidean distance to a sample in `x`.
-    """
-    # x_ = torch.from_numpy(np.asarray(x) / np.linalg.norm(x, axis=1, keepdims=True))
-    # y_ = torch.from_numpy(np.asarray(y) / np.linalg.norm(y, axis=1, keepdims=True))
-    distances = distances = _pdist(x, y)
+    """Nearest neighbor distance metric (Euclidean)."""
+    distances = _pdist(x, y)
     return np.maximum(0.0, torch.min(distances, axis=0)[0].numpy())
 
 
 def _nn_cosine_distance(x, y):
-    """Helper function for nearest neighbor distance metric (cosine).
-    Parameters
-    ----------
-    x : ndarray
-        A matrix of N row-vectors (sample points).
-    y : ndarray
-        A matrix of M row-vectors (query points).
-    Returns
-    -------
-    ndarray
-        A vector of length M that contains for each entry in `y` the
-        smallest cosine distance to a sample in `x`.
-    """
+    """Nearest neighbor distance metric (cosine)."""
     x_ = torch.from_numpy(np.asarray(x))
     y_ = torch.from_numpy(np.asarray(y))
     distances = _cosine_distance(x_, y_)
-    distances = distances
     return distances.min(axis=0)
 
 
@@ -339,21 +325,6 @@ class NearestNeighborDistanceMetric(object):
     """
     A nearest neighbor distance metric that, for each target, returns
     the closest distance to any sample that has been observed so far.
-    Parameters
-    ----------
-    metric : str
-        Either "euclidean" or "cosine".
-    matching_threshold: float
-        The matching threshold. Samples with larger distance are considered an
-        invalid match.
-    budget : Optional[int]
-        If not None, fix samples per class to at most this number. Removes
-        the oldest samples when the budget is reached.
-    Attributes
-    ----------
-    samples : Dict[int -> List[ndarray]]
-        A dictionary that maps from target identities to the list of samples
-        that have been observed so far.
     """
 
     def __init__(self, metric, matching_threshold, budget=None):
@@ -368,16 +339,6 @@ class NearestNeighborDistanceMetric(object):
         self.samples = {}
 
     def partial_fit(self, features, targets, active_targets):
-        """Update the distance metric with new data.
-        Parameters
-        ----------
-        features : ndarray
-            An NxM matrix of N features of dimensionality M.
-        targets : ndarray
-            An integer array of associated target identities.
-        active_targets : List[int]
-            A list of targets that are currently present in the scene.
-        """
         for feature, target in zip(features, targets):
             self.samples.setdefault(target, []).append(feature)
             if self.budget is not None:
@@ -385,20 +346,6 @@ class NearestNeighborDistanceMetric(object):
         self.samples = {k: self.samples[k] for k in active_targets}
 
     def distance(self, features, targets):
-        """Compute distance between features and targets.
-        Parameters
-        ----------
-        features : ndarray
-            An NxM matrix of N features of dimensionality M.
-        targets : List[int]
-            A list of targets to match the given `features` against.
-        Returns
-        -------
-        ndarray
-            Returns a cost matrix of shape len(targets), len(features), where
-            element (i, j) contains the closest squared distance between
-            `targets[i]` and `features[j]`.
-        """
         cost_matrix = np.zeros((len(targets), len(features)))
         for i, target in enumerate(targets):
             cost_matrix[i, :] = self._metric(self.samples[target], features)
